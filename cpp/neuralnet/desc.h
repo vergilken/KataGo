@@ -22,7 +22,7 @@ struct ConvLayerDesc {
   std::vector<float> weights;
 
   ConvLayerDesc();
-  ConvLayerDesc(std::istream& in);
+  ConvLayerDesc(std::istream& in, bool binaryFloats);
   ConvLayerDesc(ConvLayerDesc&& other);
 
   ConvLayerDesc(const ConvLayerDesc&) = delete;
@@ -43,7 +43,7 @@ struct BatchNormLayerDesc {
   std::vector<float> bias;
 
   BatchNormLayerDesc();
-  BatchNormLayerDesc(std::istream& in);
+  BatchNormLayerDesc(std::istream& in, bool binaryFloats);
   BatchNormLayerDesc(BatchNormLayerDesc&& other);
 
   BatchNormLayerDesc(const BatchNormLayerDesc&) = delete;
@@ -72,7 +72,7 @@ struct MatMulLayerDesc {
   std::vector<float> weights;
 
   MatMulLayerDesc();
-  MatMulLayerDesc(std::istream& in);
+  MatMulLayerDesc(std::istream& in, bool binaryFloats);
   MatMulLayerDesc(MatMulLayerDesc&& other);
 
   MatMulLayerDesc(const MatMulLayerDesc&) = delete;
@@ -87,7 +87,7 @@ struct MatBiasLayerDesc {
   std::vector<float> weights;
 
   MatBiasLayerDesc();
-  MatBiasLayerDesc(std::istream& in);
+  MatBiasLayerDesc(std::istream& in, bool binaryFloats);
   MatBiasLayerDesc(MatBiasLayerDesc&& other);
 
   MatBiasLayerDesc(const MatBiasLayerDesc&) = delete;
@@ -106,13 +106,15 @@ struct ResidualBlockDesc {
   ConvLayerDesc finalConv;
 
   ResidualBlockDesc();
-  ResidualBlockDesc(std::istream& in);
+  ResidualBlockDesc(std::istream& in, bool binaryFloats);
   ResidualBlockDesc(ResidualBlockDesc&& other);
 
   ResidualBlockDesc(const ResidualBlockDesc&) = delete;
   ResidualBlockDesc& operator=(const ResidualBlockDesc&) = delete;
 
   ResidualBlockDesc& operator=(ResidualBlockDesc&& other);
+
+  void iterConvLayers(std::function<void(const ConvLayerDesc& dest)> f) const;
 };
 
 struct DilatedResidualBlockDesc {
@@ -126,13 +128,15 @@ struct DilatedResidualBlockDesc {
   ConvLayerDesc finalConv;
 
   DilatedResidualBlockDesc();
-  DilatedResidualBlockDesc(std::istream& in);
+  DilatedResidualBlockDesc(std::istream& in, bool binaryFloats);
   DilatedResidualBlockDesc(DilatedResidualBlockDesc&& other);
 
   DilatedResidualBlockDesc(const DilatedResidualBlockDesc&) = delete;
   DilatedResidualBlockDesc& operator=(const DilatedResidualBlockDesc&) = delete;
 
   DilatedResidualBlockDesc& operator=(DilatedResidualBlockDesc&& other);
+
+  void iterConvLayers(std::function<void(const ConvLayerDesc& dest)> f) const;
 };
 
 struct GlobalPoolingResidualBlockDesc {
@@ -150,13 +154,15 @@ struct GlobalPoolingResidualBlockDesc {
   ConvLayerDesc finalConv;
 
   GlobalPoolingResidualBlockDesc();
-  GlobalPoolingResidualBlockDesc(std::istream& in, int vrsn);
+  GlobalPoolingResidualBlockDesc(std::istream& in, int vrsn, bool binaryFloats);
   GlobalPoolingResidualBlockDesc(GlobalPoolingResidualBlockDesc&& other);
 
   GlobalPoolingResidualBlockDesc(const GlobalPoolingResidualBlockDesc&) = delete;
   GlobalPoolingResidualBlockDesc& operator=(const GlobalPoolingResidualBlockDesc&) = delete;
 
   GlobalPoolingResidualBlockDesc& operator=(GlobalPoolingResidualBlockDesc&& other);
+
+  void iterConvLayers(std::function<void(const ConvLayerDesc& dest)> f) const;
 };
 
 constexpr int ORDINARY_BLOCK_KIND = 0;
@@ -180,13 +186,15 @@ struct TrunkDesc {
 
   TrunkDesc();
   ~TrunkDesc();
-  TrunkDesc(std::istream& in, int vrsn);
+  TrunkDesc(std::istream& in, int vrsn, bool binaryFloats);
   TrunkDesc(TrunkDesc&& other);
 
   TrunkDesc(const TrunkDesc&) = delete;
   TrunkDesc& operator=(const TrunkDesc&) = delete;
 
   TrunkDesc& operator=(TrunkDesc&& other);
+
+  void iterConvLayers(std::function<void(const ConvLayerDesc& dest)> f) const;
 };
 
 struct PolicyHeadDesc {
@@ -204,13 +212,15 @@ struct PolicyHeadDesc {
 
   PolicyHeadDesc();
   ~PolicyHeadDesc();
-  PolicyHeadDesc(std::istream& in, int vrsn);
+  PolicyHeadDesc(std::istream& in, int vrsn, bool binaryFloats);
   PolicyHeadDesc(PolicyHeadDesc&& other);
 
   PolicyHeadDesc(const PolicyHeadDesc&) = delete;
   PolicyHeadDesc& operator=(const PolicyHeadDesc&) = delete;
 
   PolicyHeadDesc& operator=(PolicyHeadDesc&& other);
+
+  void iterConvLayers(std::function<void(const ConvLayerDesc& dest)> f) const;
 };
 
 struct ValueHeadDesc {
@@ -230,20 +240,20 @@ struct ValueHeadDesc {
 
   ValueHeadDesc();
   ~ValueHeadDesc();
-  ValueHeadDesc(std::istream& in, int vrsn);
+  ValueHeadDesc(std::istream& in, int vrsn, bool binaryFloats);
   ValueHeadDesc(ValueHeadDesc&& other);
 
   ValueHeadDesc(const ValueHeadDesc&) = delete;
   ValueHeadDesc& operator=(const ValueHeadDesc&) = delete;
 
   ValueHeadDesc& operator=(ValueHeadDesc&& other);
+
+  void iterConvLayers(std::function<void(const ConvLayerDesc& dest)> f) const;
 };
 
 struct ModelDesc {
   std::string name;
   int version;
-  int xSizePreV3;
-  int ySizePreV3;
   int numInputChannels;
   int numInputGlobalChannels;
   int numValueChannels;
@@ -256,13 +266,16 @@ struct ModelDesc {
 
   ModelDesc();
   ~ModelDesc();
-  ModelDesc(std::istream& in);
+  ModelDesc(std::istream& in, bool binaryFloats);
   ModelDesc(ModelDesc&& other);
 
   ModelDesc(const ModelDesc&) = delete;
   ModelDesc& operator=(const ModelDesc&) = delete;
 
   ModelDesc& operator=(ModelDesc&& other);
+
+  void iterConvLayers(std::function<void(const ConvLayerDesc& dest)> f) const;
+  int maxConvChannels(int convXSize, int convYSize) const;
 
   //Loads a model from a file that may or may not be gzipped, storing it in descBuf
   static void loadFromFileMaybeGZipped(const std::string& fileName, ModelDesc& descBuf);

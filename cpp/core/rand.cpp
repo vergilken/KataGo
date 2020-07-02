@@ -1,19 +1,10 @@
 #include "../core/rand.h"
+#include "../core/os.h"
 
-#ifdef _WIN32
- #define _RAND_IS_WINDOWS
-#elif _WIN64
- #define _RAND_IS_WINDOWS
-#elif __unix || __APPLE__
-  #define _RAND_IS_UNIX
-#else
- #error Unknown OS!
-#endif
-
-#ifdef _RAND_IS_WINDOWS
+#ifdef OS_IS_WINDOWS
   #include <winsock.h>
 #endif
-#ifdef _RAND_IS_UNIX
+#ifdef OS_IS_UNIX_OR_APPLE
   #include <unistd.h>
 #endif
 
@@ -24,9 +15,11 @@
 
 #include "../core/global.h"
 #include "../core/hash.h"
+#include "../core/md5.h"
 #include "../core/sha2.h"
 #include "../core/test.h"
 #include "../core/timer.h"
+#include "../core/bsearch.h"
 
 using namespace std;
 
@@ -208,7 +201,7 @@ void Rand::init()
 
   //Mix the hostname and pid into the seed so that starting two things on different computers almost certainly
   //pick different seeds.
-#ifdef _RAND_IS_WINDOWS
+#ifdef OS_IS_WINDOWS
   {
     s += "|";
     DWORD processId = GetCurrentProcessId();
@@ -221,7 +214,7 @@ void Rand::init()
       s += string(hostNameBuf);
   }
 #endif
-#ifdef _RAND_IS_UNIX
+#ifdef OS_IS_UNIX_OR_APPLE
   {
     s += "|";
     pid_t processId = getpid();
@@ -235,10 +228,11 @@ void Rand::init()
   }
 #endif
 
-  uint64_t hash[4];
+  char hash[65];
   SHA2::get256(s.c_str(), hash);
-
-  init(Global::uint64ToHexString(hash[0]));
+  assert(hash[64] == '\0');
+  string hashed(hash);
+  init(hashed);
 }
 
 void Rand::init(uint64_t seed)
@@ -280,11 +274,24 @@ void Rand::init(const string& seed)
   numCalls = 0;
 }
 
+size_t Rand::nextIndexCumulative(const double* cumRelProbs, size_t n)
+{
+  assert(n > 0);
+  assert(n < 0xFFFFFFFF);
+  double_t sum = cumRelProbs[n-1];
+  double d = nextDouble(sum);
+  size_t r = BSearch::findFirstGt(cumRelProbs,d,0,n);
+  if(r == n)
+    return n-1;
+  return r;
+}
+
+
 //Marsaglia and Tsang's algorithm
 double Rand::nextGamma(double a) {
   if(!(a > 0.0))
     throw StringError("Rand::nextGamma: invalid value for a: " + Global::doubleToString(a));
-  
+
   if(a <= 1.0) {
     double r = nextGamma(a + 1.0);
     double inva = 1.0 / a;
@@ -293,7 +300,7 @@ double Rand::nextGamma(double a) {
     double scale = inva == 0.0 ? 1.0 : pow(nextDouble(), inva);
     return r * scale;
   }
-  
+
   double d = a - 1.0/3.0;
   double c = (1.0/3.0) / sqrt(d);
 
@@ -307,7 +314,7 @@ double Rand::nextGamma(double a) {
     double xx = x * x;
     if(u < 1.0 - 0.0331 * xx * xx)
       return d * v;
-    if(log(u) < 0.5 * xx + d * (1.0 - v + log(v)))
+    if(u == 0.0 || log(u) < 0.5 * xx + d * (1.0 - v + log(v)))
       return d * v;
   }
 
@@ -359,6 +366,16 @@ static void simpleTest()
       cout << Global::uint32ToHexString(expected[i]) << endl;
       Global::fatalError("Rand generated unexpected values");
     }
+  }
+
+  {
+    uint32_t hash[4];
+    const string s = "The quick brown fox jumps over the lazy dog.";
+    MD5::get(s.c_str(),s.length(),hash);
+    testAssert(hash[0] == 0xC209D9E4);
+    testAssert(hash[1] == 0x1CFBD090);
+    testAssert(hash[2] == 0xADFF68A0);
+    testAssert(hash[3] == 0xD0CB22DF);
   }
 
   char hash[129];
@@ -671,16 +688,41 @@ rand.nextLogistic()
   }
 
   {
+    const char* name = "nextIndexCumulative tests";
+    Rand rand(name);
+
+    double probs[5] = {1.0, 4.0, 2.5, 0.5, 2.0};
+    double cumProbs[5];
+    for(int i = 0; i<5; i++)
+      cumProbs[i] = (i == 0 ? probs[i] : probs[i] + cumProbs[i-1]);
+
+    int frequencies[5] = {0,0,0,0,0};
+    for(int i = 0; i<10000; i++) {
+      int r = (int)rand.nextIndexCumulative(cumProbs,5);
+      testAssert(r >= 0 && r < 5);
+      frequencies[r]++;
+    }
+    for(int i = 0; i<5; i++)
+      out << frequencies[i] << endl;
+
+    string expected = R"%%(
+1019
+3978
+2522
+513
+1968
+)%%";
+    TestCommon::expect(name,out,expected);
+  }
+
+  {
     const char* name = "Gamma tests";
     Rand rand("def");
 
     double tinySubnormal = 4.9406564584124654e-324;
     double tinyNormal = 2.2250738585072014e-308;
     double maxDouble = 1.7976931348623157e308;
-    out << "pow(0.5,inf) " << pow(0.5, 1.0 / 0.0) << endl;
     out << "pow(0.5,1e300) " << pow(0.5, 1.0e300) << endl;
-    out << "pow(1.0,inf) " << pow(1.0, 1.0 / 0.0) << endl;
-    out << "log(0) " << Global::doubleToString(log(0.0)) << endl;    
     out << "tinySubnormal " << Global::strprintf("%.10g",tinySubnormal) << endl;
     out << "tinyNormal " << Global::strprintf("%.10g",tinyNormal) << endl;
     out << "maxDouble " << Global::strprintf("%.10g",maxDouble) << endl;
@@ -707,14 +749,9 @@ rand.nextLogistic()
     for(int i = 0; i<8; i++) out << rand.nextGamma(1e308) << endl;
     out << "rand.nextGamma(maxDouble)" << endl;
     for(int i = 0; i<8; i++) out << rand.nextGamma(maxDouble) << endl;
-    out << "rand.nextGamma(inf)" << endl;
-    for(int i = 0; i<8; i++) out << rand.nextGamma(1.0/0.0) << endl;
 
     string expected = R"%%(
-pow(0.5,inf) 0
 pow(0.5,1e300) 0
-pow(1.0,inf) 1
-log(0) -inf
 tinySubnormal 4.940656458e-324
 tinyNormal 2.225073859e-308
 maxDouble 1.797693135e+308
@@ -874,6 +911,20 @@ rand.nextGamma(maxDouble)
 1.79769e+308
 1.79769e+308
 1.79769e+308
+)%%";
+    TestCommon::expect(name,out,expected);
+
+    if(std::numeric_limits<double>::is_iec559 && std::numeric_limits<double>::has_infinity) {
+      double inf = INFINITY;
+      out << "pow(0.5,inf) " << pow(0.5, inf) << endl;
+      out << "pow(1.0,inf) " << pow(1.0, inf) << endl;
+      out << "log(0) " << Global::doubleToString(log(0.0)) << endl;
+      out << "rand.nextGamma(inf)" << endl;
+      for(int i = 0; i<8; i++) out << rand.nextGamma(inf) << endl;
+      expected = R"%%(
+pow(0.5,inf) 0
+pow(1.0,inf) 1
+log(0) -inf
 rand.nextGamma(inf)
 inf
 inf
@@ -884,9 +935,11 @@ inf
 inf
 inf
 )%%";
-    TestCommon::expect(name,out,expected);
+      TestCommon::expect(name,out,expected);
+    }
+
   }
-  
+
   {
     const char* name = "Rand moment tests";
 
@@ -984,4 +1037,3 @@ Gamma(4.0) expected: Mean 4.000000 Variance 4.000000 Skew 1.000000 ExcessKurt 1.
   }
 
 }
-

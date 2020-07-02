@@ -12,14 +12,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <dirent.h> //TODO this is not portable to windows, use C++17 filesystem library when C++17 is available
 #include <fstream>
 #include <inttypes.h>
 #include <iomanip>
 #include <sstream>
 #include <sys/types.h>
-
-#include "global.h"
+#include <boost/filesystem.hpp>
 
 using namespace std;
 
@@ -35,21 +33,6 @@ void Global::fatalError(const string& s)
 {
   cout << "\nFATAL ERROR:\n" << s << endl;
   exit(EXIT_FAILURE);
-}
-
-//TIME------------------------------------
-
-string Global::getDateString()
-{
-  time_t rawtime;
-  time(&rawtime);
-  tm* ptm = gmtime(&rawtime);
-
-  ostringstream out;
-  out << (ptm->tm_year+1900) << "-"
-      << (ptm->tm_mon+1) << "-"
-      << (ptm->tm_mday);
-  return out.str();
 }
 
 //STRINGS---------------------------------
@@ -464,7 +447,7 @@ bool Global::isDigits(const string& str)
   return isDigits(str,0,str.size());
 }
 
-bool Global::isDigits(const string& str, int start, int end)
+bool Global::isDigits(const string& str, size_t start, size_t end)
 {
   //Too long to fit in integer for sure?
   if(end <= start)
@@ -472,9 +455,9 @@ bool Global::isDigits(const string& str, int start, int end)
   if(end-start > 9)
     return false;
 
-  int size = str.size();
+  size_t size = str.size();
   int64_t value = 0;
-  for(int i = start; i<end && i<size; i++)
+  for(size_t i = start; i<end && i<size; i++)
   {
     char c = str[i];
     if(!isDigit(c))
@@ -493,7 +476,7 @@ int Global::parseDigits(const string& str)
   return parseDigits(str,0,str.size());
 }
 
-int Global::parseDigits(const string& str, int start, int end)
+int Global::parseDigits(const string& str, size_t start, size_t end)
 {
   //Too long to fit in integer for sure?
   if(end <= start)
@@ -501,9 +484,9 @@ int Global::parseDigits(const string& str, int start, int end)
   if(end-start > 9)
     throw IOError("Could not parse digits, overflow: " + str.substr(start,end-start));
 
-  int size = str.size();
+  size_t size = str.size();
   int64_t value = 0;
-  for(int i = start; i<end && i<size; i++)
+  for(size_t i = start; i<end && i<size; i++)
   {
     char c = str[i];
     if(!isDigit(c))
@@ -610,13 +593,6 @@ string Global::stripComments(const string& str)
   return result;
 }
 
-string Global::getCompactDateTimeString() {
-  time_t time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-  ostringstream out;
-  out << std::put_time(std::localtime(&time), "%Y%m%d-%H%M%S");
-  return out.str();
-}
-
 uint64_t Global::readMem(const string& str)
 {
   if(str.size() < 2)
@@ -701,34 +677,25 @@ vector<string> Global::readFileLines(const string& filename, char delimiter)
   return readFileLines(filename.c_str(), delimiter);
 }
 
-
-//TODO this is not portable to windows, reimplement with C++17 filesystem library when C++17 is available
 void Global::collectFiles(const string& dirname, std::function<bool(const string&)> fileFilter, vector<string>& collected)
 {
-  DIR *dir;
-  struct dirent *entry;
-
-  if(!(dir = opendir(dirname.c_str()))) {
-    cerr << "Error (" << errno << ") opening " << dirname << endl;
+  namespace bfs = boost::filesystem;
+  try {
+    for(const bfs::directory_entry& entry: bfs::recursive_directory_iterator(dirname)) {
+      if(!bfs::is_directory(entry.status())) {
+        const bfs::path& path = entry.path();
+        string fileName = path.filename().string();
+        if(fileFilter(fileName)) {
+          collected.push_back(path.string());
+        }
+      }
+    }
+  }
+  catch(const bfs::filesystem_error& e) {
+    cerr << "Error recursively collectng files: " << e.what() << endl;
     return;
   }
-
-  while ((entry = readdir(dir)) != NULL) {
-    if(entry->d_type == DT_DIR) {
-      if(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-        continue;
-      const string subPath = dirname + "/" + entry->d_name;
-      collectFiles(subPath,fileFilter,collected);
-    }
-    else {
-      string fileName = string(entry->d_name);
-      if(fileFilter(fileName))
-        collected.push_back(dirname + "/" + fileName);
-    }
-  }
-  closedir(dir);
 }
-
 
 //USER IO----------------------------
 
@@ -737,11 +704,3 @@ void Global::pauseForKey()
   cout << "Press any key to continue..." << endl;
   cin.get();
 }
-
-
-
-
-
-
-
-

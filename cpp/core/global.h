@@ -9,6 +9,7 @@
 #define CORE_GLOBAL_H_
 
 #include <algorithm>
+#include <cassert>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -16,8 +17,6 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
-
-#include "../core/config.h"
 
 //GLOBAL DEFINES AND FLAGS----------------------------------------------------
 #ifdef __GNUG__  //On g++ only
@@ -122,9 +121,9 @@ namespace Global
 
   //Check if a string consists entirely of digits, and parse the integer, checking for overflow
   bool isDigits(const std::string& str);
-  bool isDigits(const std::string& str, int start, int end);
+  bool isDigits(const std::string& str, size_t start, size_t end);
   int parseDigits(const std::string& str);
-  int parseDigits(const std::string& str, int start, int end);
+  int parseDigits(const std::string& str, size_t start, size_t end);
 
   //Character properties
   bool isDigit(char c);
@@ -135,9 +134,6 @@ namespace Global
 
   //Strips "#" rest-of-line style comments from a string
   std::string stripComments(const std::string& str);
-
-  //Get a compact string representation of the date and time usable in filenames
-  std::string getCompactDateTimeString();
 
   //Key value pairs are of the form "x=y" or "x = y".
   //Multiple key value pairs are allowed on one line if comma separated.

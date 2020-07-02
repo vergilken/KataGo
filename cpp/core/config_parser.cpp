@@ -6,16 +6,71 @@
 
 using namespace std;
 
-ConfigParser::ConfigParser(const string& fname)
-  :fileName(fname),contents(),keyValues(),usedKeysMutex(),usedKeys()
-{
-  ifstream in(fileName);
-  if(!in.is_open())
-    throw IOError("Could not open config file: " + fileName);
+ConfigParser::ConfigParser()
+  :initialized(false),fileName(),contents(),keyValues(),usedKeysMutex(),usedKeys()
+{}
 
+ConfigParser::ConfigParser(const string& fname)
+  :initialized(false),fileName(),contents(),keyValues(),usedKeysMutex(),usedKeys()
+{
+  initialize(fname);
+}
+
+ConfigParser::ConfigParser(istream& in)
+  :initialized(false),fileName(),contents(),keyValues(),usedKeysMutex(),usedKeys()
+{
+  initialize(in);
+}
+
+ConfigParser::ConfigParser(const map<string, string>& kvs)
+  :initialized(false),fileName(),contents(),keyValues(),usedKeysMutex(),usedKeys()
+{
+  initialize(kvs);
+}
+
+ConfigParser::ConfigParser(const ConfigParser& source) {
+  if(!source.initialized)
+    throw StringError("Can only copy a ConfigParser which has been initialized.");
+  std::lock_guard<std::mutex> lock(source.usedKeysMutex);
+  initialized = source.initialized;
+  fileName = source.fileName;
+  contents = source.contents;
+  keyValues = source.keyValues;
+  usedKeys = source.usedKeys;
+}
+
+void ConfigParser::initialize(const string& fname) {
+  if(initialized)
+    throw StringError("ConfigParser already initialized, cannot initialize again");
+  ifstream in(fname);
+  if(!in.is_open())
+    throw IOError("Could not open config file: " + fname);
+  fileName = fname;
+  initializeInternal(in);
+  initialized = true;
+}
+
+void ConfigParser::initialize(istream& in) {
+  if(initialized)
+    throw StringError("ConfigParser already initialized, cannot initialize again");
+  initializeInternal(in);
+  initialized = true;
+}
+
+void ConfigParser::initialize(const map<string, string>& kvs) {
+  if(initialized)
+    throw StringError("ConfigParser already initialized, cannot initialize again");
+  keyValues = kvs;
+  initialized = true;
+}
+
+
+
+void ConfigParser::initializeInternal(istream& in) {
   int lineNum = 0;
   string line;
   ostringstream contentStream;
+  keyValues.clear();
   while(getline(in,line)) {
     contentStream << line << "\n";
     lineNum += 1;
@@ -33,6 +88,8 @@ ConfigParser::ConfigParser(const string& fname)
 
     string key = Global::trim(line.substr(0,pos));
     string value = Global::trim(line.substr(pos+1));
+    if(keyValues.find(key) != keyValues.end())
+      throw IOError("Key '" + key + "' + was specified multiple times in " + fileName + ", you probably didn't mean to do this, please delete one of them");
     keyValues[key] = value;
   }
   contents = contentStream.str();
@@ -47,6 +104,76 @@ string ConfigParser::getFileName() const {
 
 string ConfigParser::getContents() const {
   return contents;
+}
+
+void ConfigParser::overrideKeys(const map<string, string>& newkvs) {
+  for(auto iter = newkvs.begin(); iter != newkvs.end(); ++iter) {
+    //Assume zero-length values mean to delete a key
+    if(iter->second.length() <= 0 && keyValues.find(iter->first) != keyValues.end())
+      keyValues.erase(iter->first);
+    else
+      keyValues[iter->first] = iter->second;
+  }
+  fileName += " and/or command-line and query overrides";
+}
+
+
+void ConfigParser::overrideKeys(const map<string, string>& newkvs, const vector<pair<set<string>,set<string>>>& mutexKeySets) {
+  for(size_t i = 0; i<mutexKeySets.size(); i++) {
+    const set<string>& a = mutexKeySets[i].first;
+    const set<string>& b = mutexKeySets[i].second;
+    bool hasA = false;
+    for(auto iter = a.begin(); iter != a.end(); ++iter) {
+      if(newkvs.find(*iter) != newkvs.end()) {
+        hasA = true;
+        break;
+      }
+    }
+    bool hasB = false;
+    for(auto iter = b.begin(); iter != b.end(); ++iter) {
+      if(newkvs.find(*iter) != newkvs.end()) {
+        hasB = true;
+        break;
+      }
+    }
+    if(hasA) {
+      for(auto iter = b.begin(); iter != b.end(); ++iter)
+        keyValues.erase(*iter);
+    }
+    if(hasB) {
+      for(auto iter = a.begin(); iter != a.end(); ++iter)
+        keyValues.erase(*iter);
+    }
+  }
+
+  overrideKeys(newkvs);
+}
+
+map<string,string> ConfigParser::parseCommaSeparated(const string& commaSeparatedValues) {
+  map<string,string> keyValues;
+  vector<string> pieces = Global::split(commaSeparatedValues,',');
+  for(size_t i = 0; i<pieces.size(); i++) {
+    string s = Global::trim(pieces[i]);
+    if(s.length() <= 0)
+      continue;
+    size_t pos = s.find("=");
+    if(pos == string::npos)
+      throw IOError("Could not parse kv pair, could not find '=' in:" + s);
+
+    string key = Global::trim(s.substr(0,pos));
+    string value = Global::trim(s.substr(pos+1));
+    keyValues[key] = value;
+  }
+  return keyValues;
+}
+
+void ConfigParser::markAllKeysUsedWithPrefix(const string& prefix) {
+  std::lock_guard<std::mutex> lock(usedKeysMutex);
+  for(auto iter = keyValues.begin(); iter != keyValues.end(); ++iter) {
+    const string& key = iter->first;
+    if(Global::isPrefix(key,prefix))
+      usedKeys.insert(key);
+  }
 }
 
 void ConfigParser::warnUnusedKeys(ostream& out, Logger* logger) const {
@@ -83,7 +210,7 @@ string ConfigParser::getString(const string& key) {
     std::lock_guard<std::mutex> lock(usedKeysMutex);
     usedKeys.insert(key);
   }
-  
+
   return iter->second;
 }
 
@@ -127,6 +254,14 @@ vector<bool> ConfigParser::getBools(const string& key) {
     ret.push_back(x);
   }
   return ret;
+}
+
+enabled_t ConfigParser::getEnabled(const string& key) {
+  string value = Global::trim(Global::toLower(getString(key)));
+  enabled_t x;
+  if(!enabled_t::tryParse(value,x))
+    throw IOError("Could not parse '" + value + "' as bool or auto for key '" + key + "' in config file " + fileName);
+  return x;
 }
 
 int ConfigParser::getInt(const string& key) {

@@ -2,10 +2,18 @@
 #define NEURALNET_NNINTERFACE_H_
 
 #include "../core/global.h"
+#include "../core/commontypes.h"
 #include "../core/hash.h"
 #include "../core/logger.h"
 #include "../neuralnet/desc.h"
 #include "../neuralnet/nninputs.h"
+
+//Defined in nneval.h
+struct NNResultBuf;
+
+// A handle to cross-thread cross-gpu initialization state.
+// Create one of these per process, although creating more is fine.
+struct ComputeContext;
 
 // A handle to the local compute backend. Not thread-safe, each handle should
 // only be used by one thread.
@@ -26,16 +34,39 @@ namespace NeuralNet {
   // Call globalCleanup() at program termination.
   void globalCleanup();
 
+  //Print available backend devices
+  void printDevices();
+
   // Model I/O -----------------------------------------------------------------
 
-  LoadedModel* loadModelFile(const std::string& file, int modelFileIdx);
+  LoadedModel* loadModelFile(const std::string& file);
   void freeLoadedModel(LoadedModel* loadedModel);
 
+  std::string getModelName(const LoadedModel* loadedModel);
   int getModelVersion(const LoadedModel* loadedModel);
 
   //Return the "nearest" supported ruleset to desiredRules by this model.
   //Fills supported with true if desiredRules itself was exactly supported, false if some modifications had to be made.
   Rules getSupportedRules(const LoadedModel* loadedModel, const Rules& desiredRules, bool& supported);
+
+  // Context -------------------------------------------------------------------
+
+  ComputeContext* createComputeContext(
+    //The indices of all gpus that this context will be used for.
+    //-1 as an entry indicates to select a default
+    const std::vector<int>& gpuIdxs,
+    Logger* logger,
+    int nnXLen,
+    int nnYLen,
+    const std::string& openCLTunerFile,
+    const std::string& homeDataDirOverride,
+    bool openCLReTunePerBoardSize,
+    enabled_t useFP16Mode,
+    enabled_t useNHWCMode,
+    const LoadedModel* loadedModel
+  );
+  //A ComputeContext should NOT be freed until all ComputeHandles created using it have also been freed.
+  void freeComputeContext(ComputeContext* computeContext);
 
   // Compute Handle -----------------------------------------------------------------
 
@@ -45,17 +76,15 @@ namespace NeuralNet {
   // some info messages to it. If requireExactNNLen is true, the backend is
   // allowed to assume that all boards to evaluate will be of size exactly equal
   // to (nnXLen,nnYLen) rather than smaller, and skip any masking operations.
+  // gpuIdxForThisThread == -1 indicates to select a default GPU.
   ComputeHandle* createComputeHandle(
+    ComputeContext* context,
     const LoadedModel* loadedModel,
     Logger* logger,
     int maxBatchSize,
-    int nnXLen,
-    int nnYLen,
     bool requireExactNNLen,
     bool inputsUseNHWC,
-    int cudaGpuIdxForThisThread,
-    bool useFP16,
-    bool cudaUseNHWC
+    int gpuIdxForThisThread
   );
   void freeComputeHandle(ComputeHandle* computeHandle);
 
@@ -68,36 +97,26 @@ namespace NeuralNet {
   //One of them ("spatial") is 3-dimensional per-batch-element (4-dimensional including the batch dimension N),
   //containing floats for the the values of different features (C) across the space of the board (H,W),
   //such as placement of stones and prior move locations.
-
   //The other ("global") is 1-dimensional per-batch-element containing floats for features that are
   //global to the board state, such as game rules and komi.
-
-  // Returns a pointer to a float array of size getBatchEltSpatialLen() = H * W * C in
-  // NHWC or NCHW format that can be filled with the spatial input features.
-  float* getBatchEltSpatialInplace(InputBuffers* buffers, int nIdx);
-  // Returns a pointer to a float array of size getBatchEltGlobalLen() that can be
-  // filled with the global input features.
-  float* getBatchEltGlobalInplace(InputBuffers* buffers, int nIdx);
-
-  // Returns a pointer to bool array of length 3 to input the board symmetries that should
-  // be used to rotate/reflect the board for the neural net.
-  bool* getSymmetriesInplace(InputBuffers* buffers);
-
-  // The total number of spatial features ("C"), times nnYLen ("H"), times nnXLen ("W")
-  int getBatchEltSpatialLen(const InputBuffers* buffers);
-  // The total number of global features
-  int getBatchEltGlobalLen(const InputBuffers* buffers);
 
   //Perform Neural Net Evals ---------------------------------------------------------
 
   // Preconditions:
-  // buffers has been filled with input data for all values of nIdx in [0,numBatchEltsFilled-1]
+  // buffers inputBufs[nIdx]->{rowSpatial,rowGlobal} have been filled with input data for all values of nIdx in [0,numBatchEltsFilled-1]
   // outputs has length numBatchEltsFilled containing allocated but possibly-uninitialized NNOutput structs.
 
   // Result: mutably writes the results of the numBatchEltsFilled many parallel neural net evaluations
   // into the NNOutput structs.
   // All outputs are in logits - all final activation functions softmax, tanh, etc. are NOT applied.
-  void getOutput(ComputeHandle* computeHandle, InputBuffers* buffers, int numBatchEltsFilled, std::vector<NNOutput*>& outputs);
+  void getOutput(
+    ComputeHandle* computeHandle,
+    InputBuffers* buffers,
+    int numBatchEltsFilled,
+    NNResultBuf** inputBufs,
+    int symmetry,
+    std::vector<NNOutput*>& outputs
+  );
 
 
   //FOR TESTING -----------------------------------------------------------------------

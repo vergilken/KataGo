@@ -2,13 +2,17 @@
 
 #include <cmath>
 #include <fstream>
-#include <zstr/src/zstr.hpp>
+#include <zlib.h>
 
 #include "../core/global.h"
 #include "../neuralnet/modelversion.h"
 #include "../neuralnet/nninterface.h"
 
 using namespace std;
+
+#if !defined(BYTE_ORDER) || (BYTE_ORDER != LITTLE_ENDIAN && BYTE_ORDER != BIG_ENDIAN)
+#error Define BYTE_ORDER to be equal to either LITTLE_ENDIAN or BIG_ENDIAN
+#endif
 
 static void checkWeightFinite(float f, const string& name) {
   if(!isfinite(f))
@@ -17,10 +21,74 @@ static void checkWeightFinite(float f, const string& name) {
 #define CHECKFINITE(x, name) \
   { checkWeightFinite((x), name); }
 
+//For some strange reason, this function is noticeably faster than
+//float x; in >> x;
+static float readFloatFast(istream& in, string& tmp) {
+  in >> tmp;
+  char* endPtr;
+  const char* cstr = tmp.c_str();
+  float x = strtof(cstr,&endPtr);
+  if(endPtr == cstr)
+    in.setstate(ios_base::failbit);
+  return x;
+}
+
+static void readFloats(istream& in, size_t numFloats, bool binaryFloats, const string& name, vector<float>& buf) {
+  buf.resize(numFloats);
+  if(!binaryFloats) {
+    string tmp;
+    for(size_t i = 0; i<numFloats; i++) {
+      float x = readFloatFast(in,tmp);
+      CHECKFINITE(x,name);
+      buf[i] = x;
+    }
+    if(in.fail())
+      throw StringError(name + ": could not read float weights. Invalid model - perhaps you are trying to load a .bin.gz model as a .txt.gz model?");
+  }
+  else {
+    //KataGo hacky model format - "@BIN@" followed by the expected number of 32 bit floats, in little-endian binary
+    assert(sizeof(float) == 4);
+    {
+      string s;
+      int numCharsBeforeAt = 0;
+      while((char)in.get() != '@') {
+        numCharsBeforeAt++;
+        //Something is wrong, there should not be this much whitespace
+        if(numCharsBeforeAt > 100 || in.fail()) {
+          throw StringError(name + ": could not read float weights. Invalid model - perhaps you are trying to load a .txt.gz model as a .bin.gz model?");
+        }
+      }
+      s += (char)in.get();
+      s += (char)in.get();
+      s += (char)in.get();
+      s += (char)in.get();
+      if(s != "BIN@")
+        throw StringError(name + ": did not find expected header for binary float block");
+    }
+    float* data = buf.data();
+    char* bytes = (char*)data;
+    in.read(bytes, numFloats*sizeof(float));
+
+    if(in.fail())
+      throw StringError(name + ": did not find the expected number of floats in binary float block");
+
+#if BYTE_ORDER == BIG_ENDIAN
+    for(size_t i = 0; i<numFloats; i++) {
+      //Reverse byte order for big endian
+      std::swap(bytes[i*4 + 0], bytes[i*4 + 3]);
+      std::swap(bytes[i*4 + 1], bytes[i*4 + 2]);
+    }
+#endif
+    for(size_t i = 0; i<numFloats; i++) {
+      CHECKFINITE(buf[i],name);
+    }
+  }
+}
+
 ConvLayerDesc::ConvLayerDesc()
   : convYSize(0), convXSize(0), inChannels(0), outChannels(0), dilationY(1), dilationX(1) {}
 
-ConvLayerDesc::ConvLayerDesc(istream& in) {
+ConvLayerDesc::ConvLayerDesc(istream& in, bool binaryFloats) {
   in >> name;
   in >> convYSize;
   in >> convXSize;
@@ -50,13 +118,14 @@ ConvLayerDesc::ConvLayerDesc(istream& in) {
   int yStride = convXSize;
   int xStride = 1;
 
+  vector<float> floats;
+  readFloats(in, (size_t)convYSize * convXSize * inChannels * outChannels, binaryFloats, name, floats);
+  size_t idx = 0;
   for(int y = 0; y < convYSize; y++) {
     for(int x = 0; x < convXSize; x++) {
       for(int ic = 0; ic < inChannels; ic++) {
         for(int oc = 0; oc < outChannels; oc++) {
-          float w;
-          in >> w;
-          CHECKFINITE(w, name);
+          float w = floats[idx++];
           weights[oc * ocStride + ic * icStride + y * yStride + x * xStride] = w;
         }
       }
@@ -84,9 +153,9 @@ ConvLayerDesc& ConvLayerDesc::operator=(ConvLayerDesc&& other) {
 
 //-----------------------------------------------------------------------------
 
-BatchNormLayerDesc::BatchNormLayerDesc() : numChannels(0), epsilon(0.001), hasScale(false), hasBias(false) {}
+BatchNormLayerDesc::BatchNormLayerDesc() : numChannels(0), epsilon(0.001f), hasScale(false), hasBias(false) {}
 
-BatchNormLayerDesc::BatchNormLayerDesc(istream& in) {
+BatchNormLayerDesc::BatchNormLayerDesc(istream& in, bool binaryFloats) {
   in >> name;
   in >> numChannels;
   in >> epsilon;
@@ -101,36 +170,30 @@ BatchNormLayerDesc::BatchNormLayerDesc(istream& in) {
   if(epsilon <= 0)
     throw StringError(name + ": epsilon (" + Global::floatToString(epsilon) + ") <= 0");
 
-  float w;
-  mean.resize(numChannels);
-  for(int c = 0; c < numChannels; c++) {
-    in >> w;
-    CHECKFINITE(w, name);
-    mean[c] = w;
+  vector<float> floats;
+  readFloats(in, (size_t)numChannels, binaryFloats, name, floats);
+  mean = floats;
+  readFloats(in, (size_t)numChannels, binaryFloats, name, floats);
+  variance = floats;
+
+  if(hasScale) {
+    readFloats(in, (size_t)numChannels, binaryFloats, name, floats);
+    scale = floats;
   }
-  variance.resize(numChannels);
-  for(int c = 0; c < numChannels; c++) {
-    in >> w;
-    CHECKFINITE(w, name);
-    variance[c] = w;
+  else {
+    scale.resize(numChannels);
+    for(int c = 0; c < numChannels; c++)
+      scale[c] = 1.0;
   }
-  scale.resize(numChannels);
-  for(int c = 0; c < numChannels; c++) {
-    if(hasScale)
-      in >> w;
-    else
-      w = 1.0;
-    CHECKFINITE(w, name);
-    scale[c] = w;
+
+  if(hasBias) {
+    readFloats(in, (size_t)numChannels, binaryFloats, name, floats);
+    bias = floats;
   }
-  bias.resize(numChannels);
-  for(int c = 0; c < numChannels; c++) {
-    if(hasBias)
-      in >> w;
-    else
-      w = 1.0;
-    CHECKFINITE(w, name);
-    bias[c] = w;
+  else {
+    bias.resize(numChannels);
+    for(int c = 0; c < numChannels; c++)
+      bias[c] = 1.0;
   }
 
   if(in.fail())
@@ -176,7 +239,7 @@ ActivationLayerDesc& ActivationLayerDesc::operator=(ActivationLayerDesc&& other)
 
 MatMulLayerDesc::MatMulLayerDesc() : inChannels(0), outChannels(0) {}
 
-MatMulLayerDesc::MatMulLayerDesc(istream& in) {
+MatMulLayerDesc::MatMulLayerDesc(istream& in, bool binaryFloats) {
   in >> name;
   in >> inChannels;
   in >> outChannels;
@@ -193,11 +256,12 @@ MatMulLayerDesc::MatMulLayerDesc(istream& in) {
   int icStride = outChannels;
   int ocStride = 1;
 
+  vector<float> floats;
+  readFloats(in, (size_t)inChannels * outChannels, binaryFloats, name, floats);
+  size_t idx = 0;
   for(int ic = 0; ic < inChannels; ic++) {
     for(int oc = 0; oc < outChannels; oc++) {
-      float w;
-      in >> w;
-      CHECKFINITE(w, name);
+      float w = floats[idx++];
       weights[oc * ocStride + ic * icStride] = w;
     }
   }
@@ -221,7 +285,7 @@ MatMulLayerDesc& MatMulLayerDesc::operator=(MatMulLayerDesc&& other) {
 
 MatBiasLayerDesc::MatBiasLayerDesc() : numChannels(0) {}
 
-MatBiasLayerDesc::MatBiasLayerDesc(istream& in) {
+MatBiasLayerDesc::MatBiasLayerDesc(istream& in, bool binaryFloats) {
   in >> name;
   in >> numChannels;
 
@@ -232,12 +296,10 @@ MatBiasLayerDesc::MatBiasLayerDesc(istream& in) {
 
   weights.resize(numChannels);
 
-  for(int c = 0; c < numChannels; c++) {
-    float w;
-    in >> w;
-    CHECKFINITE(w, name);
-    weights[c] = w;
-  }
+  vector<float> floats;
+  readFloats(in, (size_t)numChannels, binaryFloats, name, floats);
+  weights = floats;
+
   if(in.fail())
     throw StringError(name + ": matbiaslayer failed to parse expected number of matbias weights");
 }
@@ -257,17 +319,17 @@ MatBiasLayerDesc& MatBiasLayerDesc::operator=(MatBiasLayerDesc&& other) {
 
 ResidualBlockDesc::ResidualBlockDesc() {}
 
-ResidualBlockDesc::ResidualBlockDesc(istream& in) {
+ResidualBlockDesc::ResidualBlockDesc(istream& in, bool binaryFloats) {
   in >> name;
   if(in.fail())
     throw StringError(name + ": res block failed to parse name");
 
-  preBN = BatchNormLayerDesc(in);
+  preBN = BatchNormLayerDesc(in,binaryFloats);
   preActivation = ActivationLayerDesc(in);
-  regularConv = ConvLayerDesc(in);
-  midBN = BatchNormLayerDesc(in);
+  regularConv = ConvLayerDesc(in,binaryFloats);
+  midBN = BatchNormLayerDesc(in,binaryFloats);
   midActivation = ActivationLayerDesc(in);
-  finalConv = ConvLayerDesc(in);
+  finalConv = ConvLayerDesc(in,binaryFloats);
 
   if(preBN.numChannels != regularConv.inChannels)
     throw StringError(
@@ -301,22 +363,27 @@ ResidualBlockDesc& ResidualBlockDesc::operator=(ResidualBlockDesc&& other) {
   return *this;
 }
 
+void ResidualBlockDesc::iterConvLayers(std::function<void(const ConvLayerDesc& desc)> f) const {
+  f(regularConv);
+  f(finalConv);
+}
+
 //-----------------------------------------------------------------------------
 
 DilatedResidualBlockDesc::DilatedResidualBlockDesc() {}
 
-DilatedResidualBlockDesc::DilatedResidualBlockDesc(istream& in) {
+DilatedResidualBlockDesc::DilatedResidualBlockDesc(istream& in, bool binaryFloats) {
   in >> name;
   if(in.fail())
     throw StringError(name + ": dilated res block failed to parse name");
 
-  preBN = BatchNormLayerDesc(in);
+  preBN = BatchNormLayerDesc(in,binaryFloats);
   preActivation = ActivationLayerDesc(in);
-  regularConv = ConvLayerDesc(in);
-  dilatedConv = ConvLayerDesc(in);
-  midBN = BatchNormLayerDesc(in);
+  regularConv = ConvLayerDesc(in,binaryFloats);
+  dilatedConv = ConvLayerDesc(in,binaryFloats);
+  midBN = BatchNormLayerDesc(in,binaryFloats);
   midActivation = ActivationLayerDesc(in);
-  finalConv = ConvLayerDesc(in);
+  finalConv = ConvLayerDesc(in,binaryFloats);
 
   if(preBN.numChannels != regularConv.inChannels)
     throw StringError(
@@ -358,25 +425,31 @@ DilatedResidualBlockDesc& DilatedResidualBlockDesc::operator=(DilatedResidualBlo
   return *this;
 }
 
+void DilatedResidualBlockDesc::iterConvLayers(std::function<void(const ConvLayerDesc& desc)> f) const {
+  f(regularConv);
+  f(dilatedConv);
+  f(finalConv);
+}
+
 //-----------------------------------------------------------------------------
 
 GlobalPoolingResidualBlockDesc::GlobalPoolingResidualBlockDesc() {}
 
-GlobalPoolingResidualBlockDesc::GlobalPoolingResidualBlockDesc(istream& in, int vrsn) {
+GlobalPoolingResidualBlockDesc::GlobalPoolingResidualBlockDesc(istream& in, int vrsn, bool binaryFloats) {
   in >> name;
   if(in.fail())
     throw StringError(name + ": gpool res block failed to parse name");
   version = vrsn;
-  preBN = BatchNormLayerDesc(in);
+  preBN = BatchNormLayerDesc(in,binaryFloats);
   preActivation = ActivationLayerDesc(in);
-  regularConv = ConvLayerDesc(in);
-  gpoolConv = ConvLayerDesc(in);
-  gpoolBN = BatchNormLayerDesc(in);
+  regularConv = ConvLayerDesc(in,binaryFloats);
+  gpoolConv = ConvLayerDesc(in,binaryFloats);
+  gpoolBN = BatchNormLayerDesc(in,binaryFloats);
   gpoolActivation = ActivationLayerDesc(in);
-  gpoolToBiasMul = MatMulLayerDesc(in);
-  midBN = BatchNormLayerDesc(in);
+  gpoolToBiasMul = MatMulLayerDesc(in,binaryFloats);
+  midBN = BatchNormLayerDesc(in,binaryFloats);
   midActivation = ActivationLayerDesc(in);
-  finalConv = ConvLayerDesc(in);
+  finalConv = ConvLayerDesc(in,binaryFloats);
 
   if(preBN.numChannels != regularConv.inChannels)
     throw StringError(
@@ -390,21 +463,12 @@ GlobalPoolingResidualBlockDesc::GlobalPoolingResidualBlockDesc(istream& in, int 
     throw StringError(
       name + Global::strprintf(
                ": gpoolBN.numChannels (%d) != gpoolConv.outChannels (%d)", gpoolBN.numChannels, gpoolConv.outChannels));
-  if(version >= 3) {
-    if(gpoolBN.numChannels * 3 != gpoolToBiasMul.inChannels)
-      throw StringError(
-        name + Global::strprintf(
-                 ": gpoolBN.numChannels * 3 (%d) != gpoolToBiasMul.inChannels (%d)",
-                 gpoolBN.numChannels * 3,
-                 gpoolToBiasMul.inChannels));
-  } else {
-    if(gpoolBN.numChannels * 2 != gpoolToBiasMul.inChannels)
-      throw StringError(
-        name + Global::strprintf(
-                 ": gpoolBN.numChannels * 2 (%d) != gpoolToBiasMul.inChannels (%d)",
-                 gpoolBN.numChannels * 2,
-                 gpoolToBiasMul.inChannels));
-  }
+  if(gpoolBN.numChannels * 3 != gpoolToBiasMul.inChannels)
+    throw StringError(
+      name + Global::strprintf(
+               ": gpoolBN.numChannels * 3 (%d) != gpoolToBiasMul.inChannels (%d)",
+               gpoolBN.numChannels * 3,
+               gpoolToBiasMul.inChannels));
   if(midBN.numChannels != regularConv.outChannels)
     throw StringError(
       name + Global::strprintf(
@@ -442,6 +506,12 @@ GlobalPoolingResidualBlockDesc& GlobalPoolingResidualBlockDesc::operator=(Global
   return *this;
 }
 
+void GlobalPoolingResidualBlockDesc::iterConvLayers(std::function<void(const ConvLayerDesc& desc)> f) const {
+  f(regularConv);
+  f(gpoolConv);
+  f(finalConv);
+}
+
 //-----------------------------------------------------------------------------
 
 TrunkDesc::TrunkDesc()
@@ -453,7 +523,7 @@ TrunkDesc::TrunkDesc()
     dilatedNumChannels(0),
     gpoolNumChannels(0) {}
 
-TrunkDesc::TrunkDesc(istream& in, int vrsn) {
+TrunkDesc::TrunkDesc(istream& in, int vrsn, bool binaryFloats) {
   in >> name;
   version = vrsn;
   in >> numBlocks;
@@ -474,7 +544,7 @@ TrunkDesc::TrunkDesc(istream& in, int vrsn) {
   if(midNumChannels != regularNumChannels + dilatedNumChannels)
     throw StringError(name + ": midNumChannels != regularNumChannels + dilatedNumChannels");
 
-  initialConv = ConvLayerDesc(in);
+  initialConv = ConvLayerDesc(in,binaryFloats);
   if(initialConv.outChannels != trunkNumChannels)
     throw StringError(
       name + Global::strprintf(
@@ -483,16 +553,14 @@ TrunkDesc::TrunkDesc(istream& in, int vrsn) {
                initialConv.outChannels,
                trunkNumChannels));
 
-  if(version >= 3) {
-    initialMatMul = MatMulLayerDesc(in);
-    if(initialMatMul.outChannels != trunkNumChannels)
-      throw StringError(
-        name + Global::strprintf(
-                 ": %s initialMatMul.outChannels (%d) != trunkNumChannels (%d)",
-                 initialMatMul.name.c_str(),
-                 initialMatMul.outChannels,
-                 trunkNumChannels));
-  }
+  initialMatMul = MatMulLayerDesc(in,binaryFloats);
+  if(initialMatMul.outChannels != trunkNumChannels)
+    throw StringError(
+      name + Global::strprintf(
+               ": %s initialMatMul.outChannels (%d) != trunkNumChannels (%d)",
+               initialMatMul.name.c_str(),
+               initialMatMul.outChannels,
+               trunkNumChannels));
 
   string kind;
   for(int i = 0; i < numBlocks; i++) {
@@ -500,7 +568,7 @@ TrunkDesc::TrunkDesc(istream& in, int vrsn) {
     if(in.fail())
       throw StringError(name + ": failed to parse block kind");
     if(kind == "ordinary_block") {
-      ResidualBlockDesc* desc = new ResidualBlockDesc(in);
+      ResidualBlockDesc* desc = new ResidualBlockDesc(in,binaryFloats);
 
       if(desc->preBN.numChannels != trunkNumChannels)
         throw StringError(
@@ -533,7 +601,7 @@ TrunkDesc::TrunkDesc(istream& in, int vrsn) {
 
       blocks.push_back(make_pair(ORDINARY_BLOCK_KIND, (void*)desc));
     } else if(kind == "dilated_block") {
-      DilatedResidualBlockDesc* desc = new DilatedResidualBlockDesc(in);
+      DilatedResidualBlockDesc* desc = new DilatedResidualBlockDesc(in,binaryFloats);
 
       if(desc->preBN.numChannels != trunkNumChannels)
         throw StringError(
@@ -566,7 +634,7 @@ TrunkDesc::TrunkDesc(istream& in, int vrsn) {
 
       blocks.push_back(make_pair(DILATED_BLOCK_KIND, (void*)desc));
     } else if(kind == "gpool_block") {
-      GlobalPoolingResidualBlockDesc* desc = new GlobalPoolingResidualBlockDesc(in, version);
+      GlobalPoolingResidualBlockDesc* desc = new GlobalPoolingResidualBlockDesc(in, version, binaryFloats);
 
       if(desc->preBN.numChannels != trunkNumChannels)
         throw StringError(
@@ -605,7 +673,7 @@ TrunkDesc::TrunkDesc(istream& in, int vrsn) {
       throw StringError(name + ": trunk istream fail after parsing block");
   }
 
-  trunkTipBN = BatchNormLayerDesc(in);
+  trunkTipBN = BatchNormLayerDesc(in,binaryFloats);
   trunkTipActivation = ActivationLayerDesc(in);
 
   if(trunkTipBN.numChannels != trunkNumChannels)
@@ -622,10 +690,12 @@ TrunkDesc::~TrunkDesc() {
     if(blocks[i].first == ORDINARY_BLOCK_KIND) {
       ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second;
       delete desc;
-    } else if(blocks[i].first == DILATED_BLOCK_KIND) {
+    }
+    else if(blocks[i].first == DILATED_BLOCK_KIND) {
       DilatedResidualBlockDesc* desc = (DilatedResidualBlockDesc*)blocks[i].second;
       delete desc;
-    } else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
+    }
+    else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
       GlobalPoolingResidualBlockDesc* desc = (GlobalPoolingResidualBlockDesc*)blocks[i].second;
       delete desc;
     }
@@ -633,6 +703,21 @@ TrunkDesc::~TrunkDesc() {
 }
 
 TrunkDesc::TrunkDesc(TrunkDesc&& other) {
+  for(int i = 0; i < blocks.size(); i++) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+      ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second;
+      delete desc;
+    }
+    else if(blocks[i].first == DILATED_BLOCK_KIND) {
+      DilatedResidualBlockDesc* desc = (DilatedResidualBlockDesc*)blocks[i].second;
+      delete desc;
+    }
+    else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
+      GlobalPoolingResidualBlockDesc* desc = (GlobalPoolingResidualBlockDesc*)blocks[i].second;
+      delete desc;
+    }
+  }
+
   name = std::move(other.name);
   version = other.version;
   numBlocks = other.numBlocks;
@@ -665,26 +750,42 @@ TrunkDesc& TrunkDesc::operator=(TrunkDesc&& other) {
   return *this;
 }
 
+void TrunkDesc::iterConvLayers(std::function<void(const ConvLayerDesc& desc)> f) const {
+  f(initialConv);
+  for(int i = 0; i < blocks.size(); i++) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+      ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second;
+      desc->iterConvLayers(f);
+    } else if(blocks[i].first == DILATED_BLOCK_KIND) {
+      DilatedResidualBlockDesc* desc = (DilatedResidualBlockDesc*)blocks[i].second;
+      desc->iterConvLayers(f);
+    } else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
+      GlobalPoolingResidualBlockDesc* desc = (GlobalPoolingResidualBlockDesc*)blocks[i].second;
+      desc->iterConvLayers(f);
+    }
+  }
+}
+
 //-----------------------------------------------------------------------------
 
 PolicyHeadDesc::PolicyHeadDesc() : version(-1) {}
 
-PolicyHeadDesc::PolicyHeadDesc(istream& in, int vrsn) {
+PolicyHeadDesc::PolicyHeadDesc(istream& in, int vrsn, bool binaryFloats) {
   in >> name;
   version = vrsn;
 
   if(in.fail())
     throw StringError(name + ": policy head failed to parse name");
 
-  p1Conv = ConvLayerDesc(in);
-  g1Conv = ConvLayerDesc(in);
-  g1BN = BatchNormLayerDesc(in);
+  p1Conv = ConvLayerDesc(in,binaryFloats);
+  g1Conv = ConvLayerDesc(in,binaryFloats);
+  g1BN = BatchNormLayerDesc(in,binaryFloats);
   g1Activation = ActivationLayerDesc(in);
-  gpoolToBiasMul = MatMulLayerDesc(in);
-  p1BN = BatchNormLayerDesc(in);
+  gpoolToBiasMul = MatMulLayerDesc(in,binaryFloats);
+  p1BN = BatchNormLayerDesc(in,binaryFloats);
   p1Activation = ActivationLayerDesc(in);
-  p2Conv = ConvLayerDesc(in);
-  gpoolToPassMul = MatMulLayerDesc(in);
+  p2Conv = ConvLayerDesc(in,binaryFloats);
+  gpoolToPassMul = MatMulLayerDesc(in,binaryFloats);
 
   if(in.fail())
     throw StringError(name + ": policy head istream fail after parsing layers");
@@ -697,54 +798,29 @@ PolicyHeadDesc::PolicyHeadDesc(istream& in, int vrsn) {
     throw StringError(
       name +
       Global::strprintf(": g1Conv.outChannels (%d) != g1BN.numChannels (%d)", g1Conv.outChannels, g1BN.numChannels));
-  if(version >= 3) {
-    if(gpoolToBiasMul.inChannels != g1BN.numChannels * 3)
-      throw StringError(
-        name + Global::strprintf(
-                 ": gpoolToBiasMul.inChannels (%d) != g1BN.numChannels*3 (%d)",
-                 gpoolToBiasMul.inChannels,
-                 g1BN.numChannels * 3));
-  } else {
-    if(gpoolToBiasMul.inChannels != g1BN.numChannels * 2)
-      throw StringError(
-        name + Global::strprintf(
-                 ": gpoolToBiasMul.inChannels (%d) != g1BN.numChannels*2 (%d)",
-                 gpoolToBiasMul.inChannels,
-                 g1BN.numChannels * 2));
-  }
+  if(gpoolToBiasMul.inChannels != g1BN.numChannels * 3)
+    throw StringError(
+      name + Global::strprintf(
+               ": gpoolToBiasMul.inChannels (%d) != g1BN.numChannels*3 (%d)",
+               gpoolToBiasMul.inChannels,
+               g1BN.numChannels * 3));
   if(gpoolToBiasMul.outChannels != p1BN.numChannels)
     throw StringError(
       name +
       Global::strprintf(
         ": gpoolToBiasMul.outChannels (%d) != p1BN.numChannels (%d)", gpoolToBiasMul.outChannels, p1BN.numChannels));
-  if(version >= 1) {
-    if(p2Conv.inChannels != p1BN.numChannels)
-      throw StringError(
-        name +
-        Global::strprintf(": p2Conv.inChannels (%d) != p1BN.numChannels (%d)", p2Conv.inChannels, p1BN.numChannels));
-  } else {
-    if(p2Conv.inChannels != p1BN.numChannels * 2)
-      throw StringError(
-        name + Global::strprintf(
-                 ": p2Conv.inChannels (%d) != p1BN.numChannels*2 (%d)", p2Conv.inChannels, p1BN.numChannels * 2));
-  }
+  if(p2Conv.inChannels != p1BN.numChannels)
+    throw StringError(
+      name +
+      Global::strprintf(": p2Conv.inChannels (%d) != p1BN.numChannels (%d)", p2Conv.inChannels, p1BN.numChannels));
   if(p2Conv.outChannels != 1)
     throw StringError(name + Global::strprintf(": p2Conv.outChannels (%d) != 1", p2Conv.outChannels));
-  if(version >= 3) {
-    if(gpoolToPassMul.inChannels != g1BN.numChannels * 3)
-      throw StringError(
-        name + Global::strprintf(
-                 ": gpoolToPassMul.inChannels (%d) != g1BN.numChannels*3 (%d)",
-                 gpoolToPassMul.inChannels,
-                 g1BN.numChannels * 3));
-  } else {
-    if(gpoolToPassMul.inChannels != g1BN.numChannels * 2)
-      throw StringError(
-        name + Global::strprintf(
-                 ": gpoolToPassMul.inChannels (%d) != g1BN.numChannels*2 (%d)",
-                 gpoolToPassMul.inChannels,
-                 g1BN.numChannels * 2));
-  }
+  if(gpoolToPassMul.inChannels != g1BN.numChannels * 3)
+    throw StringError(
+      name + Global::strprintf(
+               ": gpoolToPassMul.inChannels (%d) != g1BN.numChannels*3 (%d)",
+               gpoolToPassMul.inChannels,
+               g1BN.numChannels * 3));
   if(gpoolToPassMul.outChannels != 1)
     throw StringError(name + Global::strprintf(": gpoolToPassMul.outChannels (%d) != 1", gpoolToPassMul.outChannels));
 }
@@ -770,31 +846,35 @@ PolicyHeadDesc& PolicyHeadDesc::operator=(PolicyHeadDesc&& other) {
   return *this;
 }
 
+void PolicyHeadDesc::iterConvLayers(std::function<void(const ConvLayerDesc& desc)> f) const {
+  f(p1Conv);
+  f(g1Conv);
+  f(p2Conv);
+}
+
 //-----------------------------------------------------------------------------
 
 ValueHeadDesc::ValueHeadDesc() : version(-1) {}
 
-ValueHeadDesc::ValueHeadDesc(istream& in, int vrsn) {
+ValueHeadDesc::ValueHeadDesc(istream& in, int vrsn, bool binaryFloats) {
   in >> name;
   version = vrsn;
 
   if(in.fail())
     throw StringError(name + ": value head failed to parse name");
 
-  v1Conv = ConvLayerDesc(in);
-  v1BN = BatchNormLayerDesc(in);
+  v1Conv = ConvLayerDesc(in,binaryFloats);
+  v1BN = BatchNormLayerDesc(in,binaryFloats);
   v1Activation = ActivationLayerDesc(in);
-  v2Mul = MatMulLayerDesc(in);
-  v2Bias = MatBiasLayerDesc(in);
+  v2Mul = MatMulLayerDesc(in,binaryFloats);
+  v2Bias = MatBiasLayerDesc(in,binaryFloats);
   v2Activation = ActivationLayerDesc(in);
-  v3Mul = MatMulLayerDesc(in);
-  v3Bias = MatBiasLayerDesc(in);
+  v3Mul = MatMulLayerDesc(in,binaryFloats);
+  v3Bias = MatBiasLayerDesc(in,binaryFloats);
 
-  if(version >= 3) {
-    sv3Mul = MatMulLayerDesc(in);
-    sv3Bias = MatBiasLayerDesc(in);
-    vOwnershipConv = ConvLayerDesc(in);
-  }
+  sv3Mul = MatMulLayerDesc(in,binaryFloats);
+  sv3Bias = MatBiasLayerDesc(in,binaryFloats);
+  vOwnershipConv = ConvLayerDesc(in,binaryFloats);
 
   if(in.fail())
     throw StringError(name + ": value head istream fail after parsing layers");
@@ -804,72 +884,56 @@ ValueHeadDesc::ValueHeadDesc(istream& in, int vrsn) {
       name +
       Global::strprintf(": v1Conv.outChannels (%d) != v1BN.numChannels (%d)", v1Conv.outChannels, v1BN.numChannels));
 
-  if(version >= 3) {
-    if(v2Mul.inChannels != v1BN.numChannels * 3)
-      throw StringError(
-        name + Global::strprintf(
-                 ": v2Mul.inChannels (%d) != v1BN.numChannels*3 (%d)", v2Mul.inChannels, v1BN.numChannels * 3));
-  } else {
-    if(v2Mul.inChannels != v1BN.numChannels)
-      throw StringError(
-        name +
-        Global::strprintf(": v2Mul.inChannels (%d) != v1BN.numChannels (%d)", v2Mul.inChannels, v1BN.numChannels));
-  }
+  if(v2Mul.inChannels != v1BN.numChannels * 3)
+    throw StringError(
+      name + Global::strprintf(
+               ": v2Mul.inChannels (%d) != v1BN.numChannels*3 (%d)", v2Mul.inChannels, v1BN.numChannels * 3));
 
   if(v2Mul.outChannels != v2Bias.numChannels)
     throw StringError(
       name +
       Global::strprintf(": v2Mul.outChannels (%d) != v2Bias.numChannels (%d)", v2Mul.outChannels, v2Bias.numChannels));
-  if(version >= 1) {
-    if(v2Mul.outChannels != v3Mul.inChannels)
-      throw StringError(
-        name +
-        Global::strprintf(": v2Mul.outChannels (%d) != v3Mul.inChannels (%d)", v2Mul.outChannels, v3Mul.inChannels));
-  } else {
-    if(v2Mul.outChannels * 2 != v3Mul.inChannels)
-      throw StringError(
-        name + Global::strprintf(
-                 ": v2Mul.outChannels*2 (%d) != v3Mul.inChannels (%d)", v2Mul.outChannels * 2, v3Mul.inChannels));
+  if(v2Mul.outChannels != v3Mul.inChannels)
+    throw StringError(
+      name +
+      Global::strprintf(": v2Mul.outChannels (%d) != v3Mul.inChannels (%d)", v2Mul.outChannels, v3Mul.inChannels));
+  if(v3Mul.outChannels != 3)
+    throw StringError(name + Global::strprintf(": v3Mul.outChannels (%d) != 3", v3Mul.outChannels));
+  if(v3Bias.numChannels != 3)
+    throw StringError(name + Global::strprintf(": v3Bias.numChannels (%d) != 3", v3Bias.numChannels));
+
+  if(sv3Mul.inChannels != v2Mul.outChannels)
+    throw StringError(
+      name +
+      Global::strprintf(": sv3Mul.inChannels (%d) != v2Mul.outChannels (%d)", sv3Mul.inChannels, v2Mul.outChannels));
+
+  if(version >= 8) {
+    if(sv3Mul.outChannels != 4)
+      throw StringError(name + Global::strprintf(": sv3Mul.outChannels (%d) != 4", sv3Mul.outChannels));
+    if(sv3Bias.numChannels != 4)
+      throw StringError(name + Global::strprintf(": sv3Bias.numChannels (%d) != 4", sv3Bias.numChannels));
   }
-  if(version >= 3) {
-    if(v3Mul.outChannels != 3)
-      throw StringError(name + Global::strprintf(": v3Mul.outChannels (%d) != 3", v3Mul.outChannels));
-    if(v3Bias.numChannels != 3)
-      throw StringError(name + Global::strprintf(": v3Bias.numChannels (%d) != 3", v3Bias.numChannels));
-  } else {
-    if(v3Mul.outChannels != 1)
-      throw StringError(name + Global::strprintf(": v3Mul.outChannels (%d) != 1", v3Mul.outChannels));
-    if(v3Bias.numChannels != 1)
-      throw StringError(name + Global::strprintf(": v3Bias.numChannels (%d) != 1", v3Bias.numChannels));
+  else if(version >= 4) {
+    if(sv3Mul.outChannels != 2)
+      throw StringError(name + Global::strprintf(": sv3Mul.outChannels (%d) != 2", sv3Mul.outChannels));
+    if(sv3Bias.numChannels != 2)
+      throw StringError(name + Global::strprintf(": sv3Bias.numChannels (%d) != 2", sv3Bias.numChannels));
+  }
+  else {
+    if(sv3Mul.outChannels != 1)
+      throw StringError(name + Global::strprintf(": sv3Mul.outChannels (%d) != 1", sv3Mul.outChannels));
+    if(sv3Bias.numChannels != 1)
+      throw StringError(name + Global::strprintf(": sv3Bias.numChannels (%d) != 1", sv3Bias.numChannels));
   }
 
-  if(version >= 3) {
-    if(sv3Mul.inChannels != v2Mul.outChannels)
-      throw StringError(
-        name +
-        Global::strprintf(": sv3Mul.inChannels (%d) != v2Mul.outChannels (%d)", sv3Mul.inChannels, v2Mul.outChannels));
-
-    if(version >= 4) {
-      if(sv3Mul.outChannels != 2)
-        throw StringError(name + Global::strprintf(": sv3Mul.outChannels (%d) != 2", sv3Mul.outChannels));
-      if(sv3Bias.numChannels != 2)
-        throw StringError(name + Global::strprintf(": sv3Bias.numChannels (%d) != 2", sv3Bias.numChannels));
-    } else {
-      if(sv3Mul.outChannels != 1)
-        throw StringError(name + Global::strprintf(": sv3Mul.outChannels (%d) != 1", sv3Mul.outChannels));
-      if(sv3Bias.numChannels != 1)
-        throw StringError(name + Global::strprintf(": sv3Bias.numChannels (%d) != 1", sv3Bias.numChannels));
-    }
-
-    if(vOwnershipConv.inChannels != v1Conv.outChannels)
-      throw StringError(
-        name + Global::strprintf(
-                 ": vOwnershipConv.outChannels (%d) != v1Conv.outChannels (%d)",
-                 vOwnershipConv.inChannels,
-                 v1Conv.outChannels));
-    if(vOwnershipConv.outChannels != 1)
-      throw StringError(name + Global::strprintf(": vOwnershipConv.outChannels (%d) != 1", vOwnershipConv.outChannels));
-  }
+  if(vOwnershipConv.inChannels != v1Conv.outChannels)
+    throw StringError(
+      name + Global::strprintf(
+               ": vOwnershipConv.outChannels (%d) != v1Conv.outChannels (%d)",
+               vOwnershipConv.inChannels,
+               v1Conv.outChannels));
+  if(vOwnershipConv.outChannels != 1)
+    throw StringError(name + Global::strprintf(": vOwnershipConv.outChannels (%d) != 1", vOwnershipConv.outChannels));
 }
 
 ValueHeadDesc::~ValueHeadDesc() {}
@@ -895,40 +959,31 @@ ValueHeadDesc& ValueHeadDesc::operator=(ValueHeadDesc&& other) {
   return *this;
 }
 
+void ValueHeadDesc::iterConvLayers(std::function<void(const ConvLayerDesc& desc)> f) const {
+  f(v1Conv);
+  f(vOwnershipConv);
+}
+
 //-----------------------------------------------------------------------------
 
 ModelDesc::ModelDesc()
   : version(-1),
-    xSizePreV3(0),
-    ySizePreV3(0),
     numInputChannels(0),
     numInputGlobalChannels(0),
     numValueChannels(0),
     numScoreValueChannels(0),
     numOwnershipChannels(0) {}
 
-ModelDesc::ModelDesc(istream& in) {
+ModelDesc::ModelDesc(istream& in, bool binaryFloats) {
   in >> name;
   in >> version;
   if(in.fail())
-    throw StringError(name + ": model failed to parse name or version");
+    throw StringError("Model failed to parse name or version. Is this a valid model file?");
 
   if(version < 0 || version > NNModelVersion::latestModelVersionImplemented)
     throw StringError(name + ": model found unsupported version " + Global::intToString(version));
-  if(version < 1)
-    throw StringError("Version 0 neural nets no longer supported in cuda backend");
-
-  if(version >= 3) {
-    xSizePreV3 = 0;  // Unused, V3 uses posLen instead
-    ySizePreV3 = 0;  // Unused, V3 uses posLen instead
-  } else {
-    in >> xSizePreV3;
-    in >> ySizePreV3;
-    if(in.fail())
-      throw StringError(name + ": model failed to parse xSize or ySize");
-    if(xSizePreV3 <= 0 || ySizePreV3 <= 0)
-      throw StringError(name + ": model xSize and ySize must be positive");
-  }
+  if(version < 3)
+    throw StringError("Version 0-2 neural nets no longer supported");
 
   in >> numInputChannels;
   if(in.fail())
@@ -936,18 +991,15 @@ ModelDesc::ModelDesc(istream& in) {
   if(numInputChannels <= 0)
     throw StringError(name + ": model numInputChannels must be positive");
 
-  if(version >= 3) {
-    in >> numInputGlobalChannels;
-    if(in.fail())
-      throw StringError(name + ": model failed to parse numInputGlobalChannels");
-    if(numInputGlobalChannels <= 0)
-      throw StringError(name + ": model numInputGlobalChannels must be positive");
-  } else
-    numInputGlobalChannels = 0;
+  in >> numInputGlobalChannels;
+  if(in.fail())
+    throw StringError(name + ": model failed to parse numInputGlobalChannels");
+  if(numInputGlobalChannels <= 0)
+    throw StringError(name + ": model numInputGlobalChannels must be positive");
 
-  trunk = TrunkDesc(in, version);
-  policyHead = PolicyHeadDesc(in, version);
-  valueHead = ValueHeadDesc(in, version);
+  trunk = TrunkDesc(in, version, binaryFloats);
+  policyHead = PolicyHeadDesc(in, version, binaryFloats);
+  valueHead = ValueHeadDesc(in, version, binaryFloats);
 
   numValueChannels = valueHead.v3Mul.outChannels;
   numScoreValueChannels = valueHead.sv3Mul.outChannels;
@@ -962,14 +1014,12 @@ ModelDesc::ModelDesc(istream& in) {
                ": numInputChannels (%d) != trunk.initialConv.inChannels (%d)",
                numInputChannels,
                trunk.initialConv.inChannels));
-  if(version >= 3) {
-    if(numInputGlobalChannels != trunk.initialMatMul.inChannels)
-      throw StringError(
-        name + Global::strprintf(
-                 ": numInputChannels (%d) != trunk.initialMatMul.inChannels (%d)",
-                 numInputGlobalChannels,
-                 trunk.initialMatMul.inChannels));
-  }
+  if(numInputGlobalChannels != trunk.initialMatMul.inChannels)
+    throw StringError(
+      name + Global::strprintf(
+               ": numInputChannels (%d) != trunk.initialMatMul.inChannels (%d)",
+               numInputGlobalChannels,
+               trunk.initialMatMul.inChannels));
 
   if(trunk.trunkNumChannels != policyHead.p1Conv.inChannels)
     throw StringError(
@@ -1000,8 +1050,6 @@ ModelDesc::ModelDesc(ModelDesc&& other) {
 ModelDesc& ModelDesc::operator=(ModelDesc&& other) {
   name = std::move(other.name);
   version = other.version;
-  xSizePreV3 = other.xSizePreV3;
-  ySizePreV3 = other.ySizePreV3;
   numInputChannels = other.numInputChannels;
   numInputGlobalChannels = other.numInputGlobalChannels;
   numValueChannels = other.numValueChannels;
@@ -1013,27 +1061,172 @@ ModelDesc& ModelDesc::operator=(ModelDesc&& other) {
   return *this;
 }
 
+void ModelDesc::iterConvLayers(std::function<void(const ConvLayerDesc& desc)> f) const {
+  trunk.iterConvLayers(f);
+  policyHead.iterConvLayers(f);
+  valueHead.iterConvLayers(f);
+}
+
+int ModelDesc::maxConvChannels(int convXSize, int convYSize) const {
+  int c = 0;
+  auto f = [&c,convXSize,convYSize](const ConvLayerDesc& desc) {
+    if(desc.convXSize == convXSize && desc.convYSize == convYSize) {
+      if(desc.inChannels > c)
+        c = desc.inChannels;
+      if(desc.outChannels > c)
+        c = desc.outChannels;
+    }
+  };
+  iterConvLayers(f);
+  return c;
+}
+
+static void readEntireFileIntoString(const string& fileName, string& str) {
+  ifstream in(fileName.c_str(), ios::in | ios::binary | ios::ate);
+  if(!in.good())
+    throw StringError("Could not open file - does not exist or invalid permissions?");
+
+  ifstream::pos_type fileSize = in.tellg();
+  if(fileSize < 0)
+    throw StringError("tellg failed to determine size");
+
+  in.seekg(0, ios::beg);
+  str.resize(fileSize);
+  in.read(&str[0], fileSize);
+  in.close();
+}
+
+struct NonCopyingStreamBuf : public std::streambuf
+{
+  NonCopyingStreamBuf(string& str) {
+    char* s = &str[0];
+    size_t n = str.size();
+    setg(s, s, s + n);
+  }
+};
+
 void ModelDesc::loadFromFileMaybeGZipped(const string& fileName, ModelDesc& descBuf) {
   try {
-    //zstr has a bad property of simply aborting the program if the file doesn't exist
-    //So we try to catch this common error by explicitly testing first if the file exists by trying to open it normally
-    //to turn it into a regular C++ exception.
-    {
-      ifstream testIn(fileName);
-      if(!testIn.good())
-        throw StringError("File does not exist or could not be opened: " + fileName);
+    string lower = Global::toLower(fileName);
+    //Read model file with no compression if it's directly named .txt or .bin
+    if(Global::isSuffix(lower,".txt")) {
+      std::ifstream in(fileName);
+      if(!in.good())
+        throw StringError("Could not open file - does not exist or invalid permissions?");
+      bool binaryFloats = false;
+      descBuf = std::move(ModelDesc(in,binaryFloats));
     }
-    zstr::ifstream in(fileName);
-    descBuf = std::move(ModelDesc(in));
+    else if(Global::isSuffix(lower,".bin")) {
+      std::ifstream in(fileName, ios::in | ios::binary);
+      if(!in.good())
+        throw StringError("Could not open file - does not exist or invalid permissions?");
+      bool binaryFloats = true;
+      descBuf = std::move(ModelDesc(in,binaryFloats));
+    }
+    else if(Global::isSuffix(lower,".txt.gz") || Global::isSuffix(lower,".bin.gz") || Global::isSuffix(lower,".gz")) {
+      string* compressed = new string();
+      readEntireFileIntoString(fileName,*compressed);
+
+      static constexpr size_t CHUNK_SIZE = 262144;
+      string uncompressed;
+
+      int zret;
+      z_stream zs;
+      zs.zalloc = Z_NULL;
+      zs.zfree = Z_NULL;
+      zs.opaque = Z_NULL;
+      zs.avail_in = 0;
+      zs.next_in = Z_NULL;
+      int windowBits = 15 + 32; //Add 32 according to zlib docs to enable gzip decoding
+      zret = inflateInit2(&zs,windowBits);
+      if(zret != Z_OK) {
+        (void)inflateEnd(&zs);
+        delete compressed;
+        throw StringError("Error while ungzipping file. Invalid model file?");
+      }
+
+      zs.avail_in = compressed->size();
+      zs.next_in = (Bytef*)(&(*compressed)[0]);
+      while(true) {
+        size_t uncompressedSoFar = uncompressed.size();
+        uncompressed.resize(uncompressedSoFar + CHUNK_SIZE);
+        zs.next_out = (Bytef*)(&uncompressed[uncompressedSoFar]);
+        zs.avail_out = CHUNK_SIZE;
+        zret = inflate(&zs,Z_FINISH);
+        assert(zret != Z_STREAM_ERROR);
+        switch(zret) {
+        case Z_NEED_DICT:
+          (void)inflateEnd(&zs);
+          delete compressed;
+          throw StringError("Error while ungzipping file, Z_NEED_DICT. Invalid model file?");
+        case Z_DATA_ERROR:
+          (void)inflateEnd(&zs);
+          delete compressed;
+          throw StringError("Error while ungzipping file, Z_DATA_ERROR. Invalid model file?");
+        case Z_MEM_ERROR:
+          (void)inflateEnd(&zs);
+          delete compressed;
+          throw StringError("Error while ungzipping file, Z_MEM_ERROR. Invalid model file?");
+        default:
+          break;
+        }
+        //Output buffer space remaining?
+        if(zs.avail_out != 0) {
+          assert(zs.avail_out > 0);
+          //It must be the case that we're done
+          if(zret == Z_STREAM_END)
+            break;
+          //Otherwise, we're in trouble
+          (void)inflateEnd(&zs);
+          delete compressed;
+          throw StringError("Error while ungzipping file, reached unexpected end of input");
+        }
+      }
+      //Prune string down to just what we need
+      uncompressed.resize(uncompressed.size()-zs.avail_out);
+      //Clean up
+      (void)inflateEnd(&zs);
+      //Free up memory for compressed string
+      delete compressed;
+
+      bool binaryFloats = !Global::isSuffix(lower,".txt.gz");
+      try {
+        //Now, initialize an istream to read from the string
+        NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
+        std::istream uncompressedIn(&uncompressedStreamBuf);
+        //And read in the model desc
+        descBuf = std::move(ModelDesc(uncompressedIn,binaryFloats));
+      }
+      catch(const StringError& e) {
+        //On failure, try again to read as a .txt.gz file if the extension was ambiguous
+        bool tryAgain = binaryFloats && !Global::isSuffix(lower,".bin.gz");
+        if(!tryAgain)
+          throw;
+        else {
+          binaryFloats = false;
+          try {
+            NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
+            std::istream uncompressedIn(&uncompressedStreamBuf);
+            descBuf = std::move(ModelDesc(uncompressedIn,binaryFloats));
+          }
+          catch(const StringError& e2) {
+            throw StringError(string("Could neither parse .gz model as .txt.gz model nor as .bin.gz model, errors were:\n") + e2.what() + "\n" + e.what());
+          }
+        }
+      }
+    }
+    else {
+      throw StringError("Model file should end with .txt, .bin, .txt.gz, .bin.gz, or possibly just .gz. (If it doesn't have one of these extensions already, it's probably the wrong file, renaming will probably NOT help).");
+    }
   }
   catch(const StringError& e) {
-    throw StringError("Error parsing model file " + fileName + ": " + e.what());
+    throw StringError("Error loading or parsing model file " + fileName + ": " + e.what());
   }
 }
 
 
 Rules ModelDesc::getSupportedRules(const Rules& desiredRules, bool& supported) const {
-  static_assert(NNModelVersion::latestModelVersionImplemented == 6, "");
+  static_assert(NNModelVersion::latestModelVersionImplemented == 8, "");
   Rules rules = desiredRules;
   supported = true;
   if(version <= 6) {
@@ -1043,6 +1236,24 @@ Rules ModelDesc::getSupportedRules(const Rules& desiredRules, bool& supported) c
     }
     if(rules.scoringRule == Rules::SCORING_TERRITORY) {
       rules.scoringRule = Rules::SCORING_AREA;
+      supported = false;
+    }
+    if(rules.taxRule != Rules::TAX_NONE) {
+      rules.taxRule = Rules::TAX_NONE;
+      supported = false;
+    }
+    if(rules.hasButton) {
+      rules.hasButton = false;
+      supported = false;
+    }
+  }
+  else if(version <= 8) {
+    if(rules.koRule == Rules::KO_SPIGHT) {
+      rules.koRule = Rules::KO_SITUATIONAL;
+      supported = false;
+    }
+    if(rules.hasButton && rules.scoringRule != Rules::SCORING_AREA) {
+      rules.hasButton = false;
       supported = false;
     }
   }

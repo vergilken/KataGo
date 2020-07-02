@@ -1,33 +1,16 @@
-#include "timer.h"
+#include "../core/timer.h"
+#include "../core/os.h"
 
 /*
  * timer.cpp
  * Author: David Wu
  */
 
-#ifdef _WIN32
- #define _TIMER_IS_WINDOWS
-#elif _WIN64
- #define _TIMER_IS_WINDOWS
-#elif __unix || __APPLE__
-  #define _TIMER_IS_UNIX
-#else
- #error Unknown OS!
-#endif
-
-#ifdef _TIMER_IS_WINDOWS
-  #include <windows.h>
-#endif
-#ifdef _TIMER_IS_UNIX
-  #include <sys/time.h>
-#endif
-
-#include <stdint.h>
-#include <ctime>
-
 //WINDOWS IMPLMENTATIION-------------------------------------------------------------
 
-#ifdef _TIMER_IS_WINDOWS
+#ifdef OS_IS_WINDOWS
+#include <windows.h>
+#include <ctime>
 
 ClockTimer::ClockTimer()
 {
@@ -41,25 +24,26 @@ ClockTimer::~ClockTimer()
 
 void ClockTimer::reset()
 {
-  initialTime = (int64_t)GetTickCount();
+  initialTime = (int64_t)GetTickCount64();
 }
 
 double ClockTimer::getSeconds() const
 {
-  int64_t newTime = (int64_t)GetTickCount();
+  int64_t newTime = (int64_t)GetTickCount64();
   return (double)(newTime-initialTime)/1000.0;
 }
 
 int64_t ClockTimer::getPrecisionSystemTime()
 {
-  return (int64_t)GetTickCount();
+  return (int64_t)GetTickCount64();
 }
 
 #endif
 
 //UNIX IMPLEMENTATION------------------------------------------------------------------
 
-#ifdef _TIMER_IS_UNIX
+#ifdef OS_IS_UNIX_OR_APPLE
+#include <chrono>
 
 ClockTimer::ClockTimer()
 {
@@ -73,26 +57,22 @@ ClockTimer::~ClockTimer()
 
 void ClockTimer::reset()
 {
-  struct timeval timeval;
-  gettimeofday(&timeval,NULL);
-  initialTime = (int64_t)timeval.tv_sec * 1000000LL + (int64_t)timeval.tv_usec;
+  auto d = std::chrono::steady_clock::now().time_since_epoch();
+  initialTime = std::chrono::duration<int64_t,std::nano>(d).count();
 }
 
 double ClockTimer::getSeconds() const
 {
-  struct timeval timeval;
-  gettimeofday(&timeval,NULL);
-  int64_t newTime = (int64_t)timeval.tv_sec * 1000000LL + (int64_t)timeval.tv_usec;
-  return (double)(newTime-initialTime)/1000000.0;
+  auto d = std::chrono::steady_clock::now().time_since_epoch();
+  int64_t newTime = std::chrono::duration<int64_t,std::nano>(d).count();
+  return (double)(newTime-initialTime) / 1000000000.0;
 }
 
 int64_t ClockTimer::getPrecisionSystemTime()
 {
-  struct timeval timeval;
-  gettimeofday(&timeval,NULL);
-  return (int64_t)timeval.tv_sec * 1000000LL + (int64_t)timeval.tv_usec;
+  auto d = std::chrono::steady_clock::now().time_since_epoch();
+  int64_t newTime = std::chrono::duration<int64_t,std::nano>(d).count();
+  return newTime;
 }
 
 #endif
-
-
